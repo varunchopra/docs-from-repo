@@ -1,0 +1,46 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library")
+
+# Main binary target
+go_binary(
+    name = "cli",
+    embed = [":src_lib"],
+    pure = "on",
+    static = "on",
+    visibility = ["//visibility:public"],
+)
+
+# Cross-compilation configurations
+[
+    go_binary(
+        name = "docs-from-repo_%s_%s" % (os, arch),
+        srcs = ["main.go"],
+        goarch = arch,
+        goos = os,
+        pure = "on",
+        static = "on",
+        visibility = ["//visibility:public"]
+    )
+    for os in [
+        "darwin",
+        "linux",
+        "windows",
+    ]
+    for arch in [
+        "amd64",
+        "arm64",
+    ]
+]
+
+go_library(
+    name = "lib",
+    srcs = ["main.go"],
+    importpath = "",
+    visibility = ["//visibility:private"],
+)
+
+go_library(
+    name = "src_lib",
+    srcs = ["main.go"],
+    importpath = "github.com/varunchopra/docs-from-repo/src",
+    visibility = ["//visibility:private"],
+)

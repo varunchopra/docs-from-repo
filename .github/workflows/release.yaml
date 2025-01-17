@@ -1,0 +1,38 @@
+name: Build and Release CLI
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-and-release:
+    name: Build and Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v3
+
+      - name: Set up Bazel
+        uses: bazel-contrib/setup-bazel@0.12.1
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}
+          repository-cache: true
+
+      - name: Build binaries
+        run: |
+          mkdir -p dist
+          # Build all targets
+          bazel build //...
+          # Filter and copy only the CLI binaries to the dist directory
+          bazel cquery //src:* --output=files | grep 'docs-from-repo_' | xargs -I {} cp {} dist/
+
+      - name: Create GitHub release
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: dist/*
+          token: ${{ secrets.GITHUB_TOKEN }}
+          name: ${{ github.ref_name }}
+          tag: ${{ github.ref_name }}

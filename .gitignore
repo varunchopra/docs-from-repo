@@ -1,0 +1,7 @@
+bazel-bin
+bazel-docs-from-repo
+bazel-out
+bazel-testlogs
+
+
+output
