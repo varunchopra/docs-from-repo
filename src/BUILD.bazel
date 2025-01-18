@@ -13,12 +13,12 @@ go_binary(
 [
     go_binary(
         name = "docs-from-repo_%s_%s" % (os, arch),
-        srcs = ["main.go"],
+        embed = [":src_lib"],
         goarch = arch,
         goos = os,
         pure = "on",
         static = "on",
-        visibility = ["//visibility:public"]
+        visibility = ["//visibility:public"],
     )
     for os in [
         "darwin",
@@ -32,15 +32,15 @@ go_binary(
 ]
 
 go_library(
-    name = "lib",
-    srcs = ["main.go"],
-    importpath = "",
-    visibility = ["//visibility:private"],
-)
-
-go_library(
     name = "src_lib",
     srcs = ["main.go"],
     importpath = "github.com/varunchopra/docs-from-repo/src",
     visibility = ["//visibility:private"],
+    deps = [
+        "@com_github_go_git_go_git_v5//:go-git",
+        "@com_github_go_git_go_git_v5//config",
+        "@com_github_go_git_go_git_v5//plumbing",
+        "@com_github_go_git_go_git_v5//plumbing/transport",
+        "@com_github_go_git_go_git_v5//plumbing/transport/ssh",
+    ],
 )

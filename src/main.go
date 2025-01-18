@@ -2,16 +2,22 @@ package main
 
 import (
 	"bufio"
-	"bytes"
+	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/config" // Added this import
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/transport"
+	"github.com/go-git/go-git/v5/plumbing/transport/ssh"
 )
 
 // Constants for documentation generation
@@ -19,6 +25,185 @@ const (
 	maxLinesPerFile = 50000
 	timeFormat      = "2006-01-02 15:04:05"
 )
+
+// GitProvider handles Git operations using go-git
+type GitProvider struct {
+	logger *log.Logger
+	auth   transport.AuthMethod
+}
+
+// NewGitProvider creates a new GitProvider instance
+func NewGitProvider(logger *log.Logger) *GitProvider {
+	// Try to load SSH keys if available
+	auth, err := ssh.DefaultAuthBuilder("git")
+	if err != nil {
+		logger.Printf("SSH authentication not available: %v", err)
+		// Will proceed without auth, allowing public HTTPS access
+	}
+
+	return &GitProvider{
+		logger: logger,
+		auth:   auth,
+	}
+}
+
+// Clone clones a repository using either SSH or HTTPS
+func (p *GitProvider) Clone(ctx context.Context, repoURL, branch, destPath string) error {
+	// Try HTTPS first if it's already an HTTPS URL
+	isHTTPS := strings.HasPrefix(repoURL, "https://")
+	if isHTTPS {
+		err := p.cloneHTTPS(ctx, repoURL, branch, destPath)
+		if err == nil {
+			return nil
+		}
+		p.logger.Printf("HTTPS clone failed: %v", err)
+	}
+
+	// Try SSH if auth is available
+	if p.auth != nil {
+		err := p.cloneSSH(ctx, repoURL, branch, destPath)
+		if err == nil {
+			return nil
+		}
+		p.logger.Printf("SSH clone failed: %v", err)
+	}
+
+	// Fall back to HTTPS if not already tried
+	if !isHTTPS {
+		httpsURL := convertToHTTPS(repoURL)
+		if httpsURL != repoURL {
+			p.logger.Printf("Trying HTTPS fallback: %s", httpsURL)
+			err := p.cloneHTTPS(ctx, httpsURL, branch, destPath)
+			if err == nil {
+				return nil
+			}
+			p.logger.Printf("HTTPS fallback failed: %v", err)
+		}
+	}
+
+	return fmt.Errorf("failed to clone repository: all methods failed")
+}
+
+// cloneSSH attempts to clone using SSH authentication
+func (p *GitProvider) cloneSSH(ctx context.Context, repoURL, branch, destPath string) error {
+	cloneOpts := &git.CloneOptions{
+		URL:          repoURL,
+		Progress:     io.Discard,
+		Auth:         p.auth,
+		SingleBranch: true,
+		Tags:         git.NoTags,
+		Depth:        1,
+	}
+
+	if branch != "" {
+		cloneOpts.ReferenceName = plumbing.NewBranchReferenceName(branch)
+	}
+
+	_, err := git.PlainCloneContext(ctx, destPath, false, cloneOpts)
+	return err
+}
+
+// cloneHTTPS attempts to clone using HTTPS without authentication
+func (p *GitProvider) cloneHTTPS(ctx context.Context, repoURL, branch, destPath string) error {
+	cloneOpts := &git.CloneOptions{
+		URL:          repoURL,
+		Progress:     os.Stdout,
+		Auth:         nil, // No auth for public HTTPS
+		SingleBranch: true,
+		Depth:        1,
+	}
+
+	if branch != "" {
+		cloneOpts.ReferenceName = plumbing.NewBranchReferenceName(branch)
+	}
+
+	_, err := git.PlainCloneContext(ctx, destPath, false, cloneOpts)
+	return err
+}
+
+// GetDefaultBranch attempts to detect the default branch
+func (p *GitProvider) GetDefaultBranch(ctx context.Context, repoURL string) (string, error) {
+	// Create a temporary directory for remote inspection
+	tempDir, err := os.MkdirTemp("", "git-remote-*")
+	if err != nil {
+		return "main", nil
+	}
+	defer os.RemoveAll(tempDir)
+
+	// List remote references
+	remote := git.NewRemote(nil, &config.RemoteConfig{
+		Name: "origin",
+		URLs: []string{repoURL},
+	})
+
+	refs, err := remote.List(&git.ListOptions{Auth: p.auth})
+	if err != nil {
+		if err == transport.ErrAuthenticationRequired {
+			// Try HTTPS if SSH fails
+			httpsURL := convertToHTTPS(repoURL)
+			if httpsURL != repoURL {
+				remote = git.NewRemote(nil, &config.RemoteConfig{
+					Name: "origin",
+					URLs: []string{httpsURL},
+				})
+				refs, err = remote.List(&git.ListOptions{})
+			}
+		}
+		if err != nil {
+			return "main", nil
+		}
+	}
+
+	// Look for HEAD reference
+	for _, ref := range refs {
+		if ref.Name().IsBranch() && strings.HasPrefix(ref.Name().String(), "refs/heads/") {
+			if ref.Name().String() == "refs/heads/main" || ref.Name().String() == "refs/heads/master" {
+				return ref.Name().Short(), nil
+			}
+		}
+	}
+
+	return "main", nil
+}
+
+func (p *GitProvider) GetRepoInfo(ctx context.Context, repoPath string) (RepoInfo, error) {
+	repo, err := git.PlainOpen(repoPath)
+	if err != nil {
+		return RepoInfo{}, fmt.Errorf("failed to open repository: %w", err)
+	}
+
+	head, err := repo.Head()
+	if err != nil {
+		return RepoInfo{}, fmt.Errorf("failed to get HEAD: %w", err)
+	}
+
+	commit, err := repo.CommitObject(head.Hash())
+	if err != nil {
+		return RepoInfo{}, fmt.Errorf("failed to get commit: %w", err)
+	}
+
+	branch := head.Name().Short()
+	if branch == "" {
+		branch = "HEAD"
+	}
+
+	return RepoInfo{
+		Branch:     branch,
+		CommitHash: head.Hash().String()[:8],
+		Author:     commit.Author.Name,
+		Date:       commit.Author.When.Format(timeFormat),
+		Subject:    commit.Message,
+	}, nil
+}
+
+// RepoInfo contains repository metadata
+type RepoInfo struct {
+	Branch     string
+	CommitHash string
+	Author     string
+	Date       string
+	Subject    string
+}
 
 // RepoDocGenerator handles the documentation generation process
 type RepoDocGenerator struct {
@@ -28,6 +213,7 @@ type RepoDocGenerator struct {
 	TempDir       string
 	RepoPath      string
 	Logger        *log.Logger
+	GitProvider   *GitProvider
 	excludedFiles map[string]bool
 	excludedLangs map[string]bool
 }
@@ -35,10 +221,11 @@ type RepoDocGenerator struct {
 // NewRepoDocGenerator creates a new RepoDocGenerator instance
 func NewRepoDocGenerator(repoURL, outputDir, branch string, logger *log.Logger) *RepoDocGenerator {
 	return &RepoDocGenerator{
-		RepoURL:   repoURL,
-		OutputDir: outputDir,
-		Branch:    branch,
-		Logger:    logger,
+		RepoURL:     repoURL,
+		OutputDir:   outputDir,
+		Branch:      branch,
+		Logger:      logger,
+		GitProvider: NewGitProvider(logger),
 		excludedFiles: map[string]bool{
 			"CHANGELOG.md":       true,
 			"CONTRIBUTING.md":    true,
@@ -80,87 +267,23 @@ func (g *RepoDocGenerator) Cleanup() {
 	}
 }
 
-// runGitCommand executes a git command and returns its output
-func (g *RepoDocGenerator) runGitCommand(dir string, args ...string) (string, error) {
-	cmd := exec.Command("git", args...)
-	if dir != "" {
-		cmd.Dir = dir
-	}
-
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	err := cmd.Run()
-	if err != nil {
-		return "", fmt.Errorf("git command failed: %w\nstderr: %s", err, stderr.String())
-	}
-
-	return strings.TrimSpace(stdout.String()), nil
-}
-
-// DetectDefaultBranch attempts to detect the default branch of the repository
-func (g *RepoDocGenerator) DetectDefaultBranch() (string, error) {
-	output, err := g.runGitCommand("", "ls-remote", "--symref", g.RepoURL, "HEAD")
-	if err != nil {
-		return "main", nil // fallback to main if detection fails
-	}
-
-	for _, line := range strings.Split(output, "\n") {
-		if strings.HasPrefix(line, "ref:") {
-			parts := strings.Fields(line)
-			if len(parts) >= 2 {
-				return filepath.Base(parts[1]), nil
-			}
-		}
-	}
-
-	return "main", nil
-}
-
 // CloneRepository clones the git repository
 func (g *RepoDocGenerator) CloneRepository() error {
 	if g.Branch == "" {
 		var err error
-		g.Branch, err = g.DetectDefaultBranch()
+		g.Branch, err = g.GitProvider.GetDefaultBranch(context.Background(), g.RepoURL)
 		if err != nil {
 			g.Logger.Printf("Warning: Could not detect default branch: %v", err)
 		}
 	}
 
-	_, err := g.runGitCommand("", "clone", "--depth", "1", "-b", g.Branch, g.RepoURL, g.RepoPath)
+	err := g.GitProvider.Clone(context.Background(), g.RepoURL, g.Branch, g.RepoPath)
 	if err != nil && g.Branch == "main" {
 		g.Logger.Println("Branch 'main' not found, trying 'master'...")
 		g.Branch = "master"
-		_, err = g.runGitCommand("", "clone", "--depth", "1", "-b", g.Branch, g.RepoURL, g.RepoPath)
+		err = g.GitProvider.Clone(context.Background(), g.RepoURL, g.Branch, g.RepoPath)
 	}
 	return err
-}
-
-// GetRepoInfo retrieves repository information
-func (g *RepoDocGenerator) GetRepoInfo() (map[string]string, error) {
-	branch, err := g.runGitCommand(g.RepoPath, "rev-parse", "--abbrev-ref", "HEAD")
-	if err != nil {
-		return nil, err
-	}
-
-	commitInfo, err := g.runGitCommand(g.RepoPath, "log", "-1", "--format=%H%n%an%n%ad%n%s")
-	if err != nil {
-		return nil, err
-	}
-
-	parts := strings.Split(commitInfo, "\n")
-	if len(parts) < 4 {
-		return nil, fmt.Errorf("unexpected git log output format")
-	}
-
-	return map[string]string{
-		"branch":      branch,
-		"commit_hash": parts[0][:8],
-		"author":      parts[1],
-		"date":        parts[2],
-		"subject":     parts[3],
-	}, nil
 }
 
 // shouldIncludeFile determines if a file should be included in documentation
@@ -252,7 +375,7 @@ func (g *RepoDocGenerator) findMarkdownFiles() ([]MarkdownFile, error) {
 
 // generateRepoContext generates repository context information
 func (g *RepoDocGenerator) generateRepoContext() (string, error) {
-	repoInfo, err := g.GetRepoInfo()
+	repoInfo, err := g.GitProvider.GetRepoInfo(context.Background(), g.RepoPath)
 	if err != nil {
 		return "", err
 	}
@@ -261,11 +384,11 @@ func (g *RepoDocGenerator) generateRepoContext() (string, error) {
 	b.WriteString("# Repository Documentation\n\n")
 	b.WriteString("## Repository Context\n\n")
 	b.WriteString(fmt.Sprintf("Repository URL: %s\n", g.RepoURL))
-	b.WriteString(fmt.Sprintf("Branch: %s\n", repoInfo["branch"]))
-	b.WriteString(fmt.Sprintf("Last Commit: %s\n", repoInfo["commit_hash"]))
-	b.WriteString(fmt.Sprintf("Last Commit Date: %s\n", repoInfo["date"]))
-	b.WriteString(fmt.Sprintf("Author: %s\n", repoInfo["author"]))
-	b.WriteString(fmt.Sprintf("Subject: %s\n\n", repoInfo["subject"]))
+	b.WriteString(fmt.Sprintf("Branch: %s\n", repoInfo.Branch))
+	b.WriteString(fmt.Sprintf("Last Commit: %s\n", repoInfo.CommitHash))
+	b.WriteString(fmt.Sprintf("Last Commit Date: %s\n", repoInfo.Date))
+	b.WriteString(fmt.Sprintf("Author: %s\n", repoInfo.Author))
+	b.WriteString(fmt.Sprintf("Subject: %s\n\n", repoInfo.Subject))
 	b.WriteString("This document is a compilation of selected markdown documentation found in the repository.\n")
 	b.WriteString("Each section maintains the original directory structure and content.\n\n")
 	b.WriteString(fmt.Sprintf("*Generated on: %s*\n", time.Now().Format(timeFormat)))
@@ -369,7 +492,31 @@ type MarkdownFile struct {
 	ModifiedTime time.Time
 }
 
-func processRepository(repoURL, outputDir, branch string, verbose bool) error {
+// Helper functions
+func convertToHTTPS(repoURL string) string {
+	if strings.HasPrefix(repoURL, "git@github.com:") {
+		// Convert SSH URL to HTTPS
+		repoPath := strings.TrimPrefix(repoURL, "git@github.com:")
+		return fmt.Sprintf("https://github.com/%s", strings.TrimSuffix(repoPath, ".git"))
+	}
+	return repoURL
+}
+
+func isValidGitURL(urlStr string) bool {
+	// Check for valid SSH format
+	if strings.HasPrefix(urlStr, "git@github.com:") && strings.HasSuffix(urlStr, ".git") {
+		return true
+	}
+
+	// Check for valid HTTPS format
+	if strings.HasPrefix(urlStr, "https://github.com/") && strings.HasSuffix(urlStr, ".git") {
+		return true
+	}
+
+	return false
+}
+
+func processRepository(ctx context.Context, repoURL, outputDir, branch string, verbose bool) error {
 	logger := log.New(os.Stdout, "", log.LstdFlags)
 	if verbose {
 		logger.SetFlags(log.LstdFlags | log.Lshortfile)
@@ -408,6 +555,10 @@ func readRepoURLs(filePath string) ([]string, error) {
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line != "" && !strings.HasPrefix(line, "#") {
+			if !isValidGitURL(line) {
+				log.Printf("Warning: Skipping invalid Git URL: %s", line)
+				continue
+			}
 			urls = append(urls, line)
 		}
 	}
@@ -417,6 +568,45 @@ func readRepoURLs(filePath string) ([]string, error) {
 	}
 
 	return urls, nil
+}
+
+func processRepositories(ctx context.Context, inputFile string, outputDir string, branch string, verbose bool) error {
+	urls, err := readRepoURLs(inputFile)
+	if err != nil {
+		return fmt.Errorf("failed to read repository URLs: %w", err)
+	}
+
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, 4) // Limit concurrent processing
+	errors := make(chan error, len(urls))
+
+	for _, url := range urls {
+		wg.Add(1)
+		go func(repoURL string) {
+			defer wg.Done()
+			semaphore <- struct{}{}        // Acquire
+			defer func() { <-semaphore }() // Release
+
+			if err := processRepository(ctx, repoURL, outputDir, branch, verbose); err != nil {
+				errors <- fmt.Errorf("error processing repository %s: %w", repoURL, err)
+			}
+		}(url)
+	}
+
+	wg.Wait()
+	close(errors)
+
+	// Collect all errors
+	var errMsgs []string
+	for err := range errors {
+		errMsgs = append(errMsgs, err.Error())
+	}
+
+	if len(errMsgs) > 0 {
+		return fmt.Errorf("encountered errors:\n%s", strings.Join(errMsgs, "\n"))
+	}
+
+	return nil
 }
 
 func main() {
@@ -449,37 +639,18 @@ func main() {
 	}
 
 	input := fs.Arg(0)
+	ctx := context.Background()
 
 	// Check if input is a file
 	if info, err := os.Stat(input); err == nil && !info.IsDir() {
-		log.Printf("Reading repository URLs from file: %s", input)
-		urls, err := readRepoURLs(input)
+		err = processRepositories(ctx, input, outputDir, branch, verbose)
 		if err != nil {
-			log.Fatalf("Failed to read repository URLs: %v", err)
+			log.Fatalf("Failed to process repositories: %v", err)
 		}
-
-		// Process repositories concurrently with a worker pool
-		var wg sync.WaitGroup
-		semaphore := make(chan struct{}, 4) // Limit concurrent processing
-
-		for _, url := range urls {
-			wg.Add(1)
-			go func(repoURL string) {
-				defer wg.Done()
-				semaphore <- struct{}{}        // Acquire
-				defer func() { <-semaphore }() // Release
-
-				log.Printf("Processing repository: %s", repoURL)
-				if err := processRepository(repoURL, outputDir, branch, verbose); err != nil {
-					log.Printf("Error processing repository %s: %v", repoURL, err)
-				}
-			}(url)
-		}
-
-		wg.Wait()
 	} else {
 		// Process single repository
-		if err := processRepository(input, outputDir, branch, verbose); err != nil {
+		err = processRepository(ctx, input, outputDir, branch, verbose)
+		if err != nil {
 			log.Fatalf("Failed to process repository: %v", err)
 		}
 	}
