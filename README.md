@@ -1,33 +1,43 @@
 # docs-from-repo
 
-A CLI tool to compile Markdown files from one or more Git repositories into easily readable documents.
+A CLI tool to compile Markdown files from one or more Git repositories into a master Markdown file.
 
-## Prerequisites
+This is particularly useful if you have documentation spread across multiple Git repositories and want to upload it for use in [NotebookLM](https://notebooklm.google.com/).
 
-- Git installed on your PATH
+For example, if you're learning about Bazel and have several repositories like [rules_oci](https://github.com/bazel-contrib/rules_oci), [bazelisk](https://github.com/bazelbuild/bazelisk/), and [rules_go](https://github.com/bazel-contrib/rules_go/), you can use `docs-from-repo` to collate all the documentation from these repositories. Once collated, you can upload the master Markdown file to NotebookLM and ask questions directly.
 
 ## Usage
 
-Single repository:
+Download the appropriate binary from [releases](https://github.com/varunchopra/docs-from-repo/releases) (update the binary name and version as needed):
 
-    ./docs-from-repo https://github.com/example/repo.git
+    wget https://github.com/varunchopra/docs-from-repo/releases/download/v0.0.2/docs-from-repo_linux_amd64 -O /usr/local/bin/docs-from-repo
 
-Multiple repositories:
+Grant executable permissions:
 
-1. Create a file (e.g. `repos.txt`):
+    chmod +x /usr/local/bin/docs-from-repo
 
-       https://github.com/example/repo.git
-       https://github.com/example/repo.git
+### Single Repository
 
-2. Run:
+Run the following command:
 
-       ./docs-from-repo repos.txt
+    docs-from-repo https://github.com/example/repo.git
+
+### Multiple Repositories
+
+Create a file (e.g., `repos.txt`) containing the list of repositories:
+
+    https://github.com/example/repo.git
+    https://github.com/example/repo.git
+
+Run the tool with the file as input:
+
+    docs-from-repo repos.txt
 
 ## Customizing Output
 
 By default, documentation goes into `output`. To specify a different directory:
 
-    ./docs-from-repo -output-dir /path/to/mydocs https://github.com/example/repo.git
+    docs-from-repo -output-dir /path/to/mydocs https://github.com/example/repo.git
 
 ## Development
 
@@ -35,5 +45,4 @@ By default, documentation goes into `output`. To specify a different directory:
 
 ## Future Improvements
 
-- Use [go-git](https://github.com/go-git/go-git) to remove the Git binary dependency
 - Add test coverage
