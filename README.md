@@ -35,5 +35,4 @@ By default, documentation goes into `output`. To specify a different directory:
 
 ## Future Improvements
 
-- Use [go-git](https://github.com/go-git/go-git) to remove the Git binary dependency
 - Add test coverage
